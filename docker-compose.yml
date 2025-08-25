@@ -1,0 +1,92 @@
+services:
+  db:
+    image: postgres:15
+    container_name: odoo-postgres
+    environment:
+      POSTGRES_DB: odoo
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo123
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/pgdata
+    ports:
+      - "5433:5432"
+    networks:
+      - odoo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  odoo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: odoo-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Database configuration
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: odoo
+      DB_PASSWORD: odoo123
+      
+      # Odoo configuration
+      ADMIN_PASSWORD: admin123
+      WORKERS: 2
+      MAX_CRON_THREADS: 2
+      LOG_LEVEL: info
+      
+      # Custom addons path (if you have custom addons)
+      # ADDONS_PATH: /opt/odoo/addons,/opt/odoo/odoo/addons,/opt/odoo/custom-addons
+    volumes:
+      # Persistent data storage
+      - odoo_data:/var/lib/odoo
+      - odoo_logs:/var/log/odoo
+      
+      # Mount custom addons directory (uncomment if you have custom addons)
+      # - ./custom-addons:/opt/odoo/custom-addons:ro
+      
+      # Mount configuration file for easy editing (optional)
+      # - ./odoo.conf:/etc/odoo/odoo.conf:ro
+    ports:
+      - "8069:8069"
+    networks:
+      - odoo-network
+    restart: unless-stopped
+    command: ["odoo", "--database=rd-demo"]
+
+  # Optional: pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: odoo-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@odoo.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    ports:
+      - "8080:80"
+    networks:
+      - odoo-network
+    restart: unless-stopped
+    profiles:
+      - admin  # Only start with: docker-compose --profile admin up
+
+volumes:
+  postgres_data:
+    driver: local
+  odoo_data:
+    driver: local
+  odoo_logs:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  odoo-network:
+    driver: bridge 

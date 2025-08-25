@@ -1,0 +1,198 @@
+# Production Multi-stage Dockerfile for Odoo
+# Self-contained, immutable, security-hardened
+
+#=============================================================================
+# Stage 1: Builder - Compile dependencies and prepare artifacts
+#=============================================================================
+FROM python:3.11-slim-bullseye AS builder
+
+# Build-time environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    libpq-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    libjpeg-dev \
+    libfreetype6-dev \
+    libffi-dev \
+    libldap2-dev \
+    libsasl2-dev \
+    libssl-dev \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create build directory
+WORKDIR /build
+
+# Copy source code and requirements
+COPY . ./
+COPY requirements.txt ./
+
+# Upgrade pip and install build tools
+RUN pip install --upgrade pip setuptools wheel
+
+# Install all Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt lxml_html_clean
+
+# Install Odoo in development mode (creates .egg-link)
+RUN pip install --no-cache-dir -e .
+
+# Pre-compile Python bytecode for faster startup
+RUN python -m compileall /usr/local/lib/python3.11/site-packages/ || true
+
+#=============================================================================
+# Stage 2: Production Runtime - Minimal, secure image
+#=============================================================================
+FROM python:3.11-slim-bullseye AS production
+
+# Production environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/opt/odoo \
+    ODOO_RC=/etc/odoo/odoo.conf \
+    ODOO_DATA_DIR=/var/lib/odoo \
+    # Security hardening
+    PYTHONHASHSEED=random \
+    # Performance optimization
+    MALLOC_ARENA_MAX=2
+
+# Install only runtime dependencies (no build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # PostgreSQL client
+    postgresql-client \
+    # Runtime libraries for compiled Python packages
+    libpq5 \
+    libxml2 \
+    libxslt1.1 \
+    libjpeg62-turbo \
+    libfreetype6 \
+    libffi7 \
+    libldap-2.4-2 \
+    libsasl2-2 \
+    libssl1.1 \
+    # Essential utilities
+    curl \
+    # Fonts for PDF generation
+    fonts-liberation \
+    fonts-dejavu-core \
+    # Locale support
+    locales \
+    # Clean up in same layer to minimize size
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get autoremove -y \
+    && apt-get clean \
+    && rm -rf /tmp/* /var/tmp/*
+
+# Set up locale
+RUN sed -i '/^#.* en_US.UTF-8 /s/^#//' /etc/locale.gen && \
+    locale-gen && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8
+
+# Create odoo user and group with specific UID/GID for security
+RUN groupadd -r -g 101 odoo && \
+    useradd -r -g odoo -u 101 -d /var/lib/odoo -s /bin/false odoo
+
+# Create directory structure with proper permissions
+RUN mkdir -p /etc/odoo \
+             /var/lib/odoo \
+             /var/log/odoo \
+             /opt/odoo \
+    && chown -R odoo:odoo /var/lib/odoo /var/log/odoo \
+    && chmod 750 /var/lib/odoo /var/log/odoo
+
+# Set working directory
+WORKDIR /opt/odoo
+
+# Copy Python packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy Odoo source code with proper ownership
+COPY --chown=odoo:odoo --from=builder /build/odoo ./odoo
+COPY --chown=odoo:odoo --from=builder /build/addons ./addons
+COPY --chown=odoo:odoo --from=builder /build/odoo-bin ./odoo-bin
+COPY --chown=odoo:odoo --from=builder /build/setup.py ./setup.py
+
+# Make odoo-bin executable
+RUN chmod +x ./odoo-bin
+
+# Create optimized production configuration
+RUN echo "[options]" > /etc/odoo/odoo.conf && \
+    echo "addons_path = /opt/odoo/addons,/opt/odoo/odoo/addons" >> /etc/odoo/odoo.conf && \
+    echo "data_dir = /var/lib/odoo" >> /etc/odoo/odoo.conf && \
+    echo "logfile = False" >> /etc/odoo/odoo.conf && \
+    echo "log_handler = :INFO" >> /etc/odoo/odoo.conf && \
+    echo "log_level = info" >> /etc/odoo/odoo.conf && \
+    echo "syslog = False" >> /etc/odoo/odoo.conf && \
+    echo "without_demo = all" >> /etc/odoo/odoo.conf && \
+    echo "# Database settings" >> /etc/odoo/odoo.conf && \
+    echo "db_host = db" >> /etc/odoo/odoo.conf && \
+    echo "db_port = 5432" >> /etc/odoo/odoo.conf && \
+    echo "db_user = odoo" >> /etc/odoo/odoo.conf && \
+    echo "db_password = odoo" >> /etc/odoo/odoo.conf && \
+    echo "db_maxconn = 64" >> /etc/odoo/odoo.conf && \
+    echo "# Performance settings" >> /etc/odoo/odoo.conf && \
+    echo "workers = 4" >> /etc/odoo/odoo.conf && \
+    echo "max_cron_threads = 2" >> /etc/odoo/odoo.conf && \
+    echo "limit_memory_hard = 2684354560" >> /etc/odoo/odoo.conf && \
+    echo "limit_memory_soft = 2147483648" >> /etc/odoo/odoo.conf && \
+    echo "limit_time_cpu = 600" >> /etc/odoo/odoo.conf && \
+    echo "limit_time_real = 1200" >> /etc/odoo/odoo.conf && \
+    echo "limit_request = 8192" >> /etc/odoo/odoo.conf && \
+    echo "# Security settings" >> /etc/odoo/odoo.conf && \
+    echo "list_db = False" >> /etc/odoo/odoo.conf && \
+    echo "proxy_mode = True" >> /etc/odoo/odoo.conf && \
+    chown root:odoo /etc/odoo/odoo.conf && \
+    chmod 640 /etc/odoo/odoo.conf
+
+# Copy optimized entrypoint script
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint
+RUN chmod +x /usr/local/bin/docker-entrypoint
+
+# Create health check script
+RUN echo '#!/bin/bash' > /usr/local/bin/healthcheck && \
+    echo 'curl -f http://localhost:8069/web/database/selector || exit 1' >> /usr/local/bin/healthcheck && \
+    chmod +x /usr/local/bin/healthcheck
+
+# Remove unnecessary files to reduce attack surface
+RUN find /usr/local/lib/python3.11/site-packages -name "*.pyc" -delete && \
+    find /usr/local/lib/python3.11/site-packages -name "__pycache__" -type d -exec rm -rf {} + || true && \
+    rm -rf /tmp/* /var/tmp/* /root/.cache
+
+# Switch to non-root user
+USER odoo
+
+# Expose port
+EXPOSE 8069
+
+# Add health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD /usr/local/bin/healthcheck
+
+# Set default volumes (for data persistence in production)
+VOLUME ["/var/lib/odoo"]
+
+# Production entrypoint
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]
+CMD ["odoo"]
+
+# Add labels for better maintainability
+LABEL maintainer="Production Team" \
+      version="1.0" \
+      description="Production-ready Odoo 18.0 container" \
+      odoo.version="18.0" \
+      security.non-root="true" \
+      build.multi-stage="true" 
